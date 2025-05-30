@@ -387,35 +387,71 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
 
 def main(source_video_path: str, target_video_path: str, device: str, mode: Mode) -> None:
-    if mode == Mode.PITCH_DETECTION:
-        frame_generator = run_pitch_detection(
-            source_video_path=source_video_path, device=device)
-    elif mode == Mode.PLAYER_DETECTION:
-        frame_generator = run_player_detection(
-            source_video_path=source_video_path, device=device)
-    elif mode == Mode.BALL_DETECTION:
-        frame_generator = run_ball_detection(
-            source_video_path=source_video_path, device=device)
-    elif mode == Mode.PLAYER_TRACKING:
-        frame_generator = run_player_tracking(
-            source_video_path=source_video_path, device=device)
-    elif mode == Mode.TEAM_CLASSIFICATION:
-        frame_generator = run_team_classification(
-            source_video_path=source_video_path, device=device)
-    elif mode == Mode.RADAR:
-        frame_generator = run_radar(
-            source_video_path=source_video_path, device=device)
-    else:
-        raise NotImplementedError(f"Mode {mode} is not implemented.")
+    print(f"Starting processing in {mode} mode...")
+    print(f"Source: {source_video_path}")
+    print(f"Target: {target_video_path}")
+    print(f"Device: {device}")
+    
+    try:
+        if mode == Mode.PITCH_DETECTION:
+            frame_generator = run_pitch_detection(
+                source_video_path=source_video_path, device=device)
+        elif mode == Mode.PLAYER_DETECTION:
+            frame_generator = run_player_detection(
+                source_video_path=source_video_path, device=device)
+        elif mode == Mode.BALL_DETECTION:
+            frame_generator = run_ball_detection(
+                source_video_path=source_video_path, device=device)
+        elif mode == Mode.PLAYER_TRACKING:
+            frame_generator = run_player_tracking(
+                source_video_path=source_video_path, device=device)
+        elif mode == Mode.TEAM_CLASSIFICATION:
+            frame_generator = run_team_classification(
+                source_video_path=source_video_path, device=device)
+        elif mode == Mode.RADAR:
+            frame_generator = run_radar(
+                source_video_path=source_video_path, device=device)
+        else:
+            raise NotImplementedError(f"Mode {mode} is not implemented.")
 
-    video_info = sv.VideoInfo.from_video_path(source_video_path)
-    with sv.VideoSink(target_video_path, video_info) as sink:
+        print("Loading video info...")
+        video_info = sv.VideoInfo.from_video_path(source_video_path)
+        print(f"Video info: {video_info.width}x{video_info.height}, {video_info.fps} FPS, {video_info.total_frames} frames")
+        
+        # Use MP4V codec for better Colab compatibility
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(target_video_path, fourcc, video_info.fps, (video_info.width, video_info.height))
+        
+        if not out.isOpened():
+            print("Error: Could not open video writer")
+            return
+            
+        frame_count = 0
+        print("Starting frame processing...")
+        
         for frame in frame_generator:
-            sink.write_frame(frame)
+            out.write(frame)
+            frame_count += 1
+            if frame_count % 30 == 0:  # Print progress every 30 frames
+                print(f"Processed {frame_count} frames...")
 
             #cv2.imshow("frame", frame)
             #if cv2.waitKey(1) & 0xFF == ord("q"):
                 #break
+                
+        out.release()
+        print(f"Video processing complete! Processed {frame_count} frames.")
+        print(f"Output saved to: {target_video_path}")
+        
+        # Check output file size
+        if os.path.exists(target_video_path):
+            file_size = os.path.getsize(target_video_path)
+            print(f"Output file size: {file_size} bytes ({file_size/1024/1024:.2f} MB)")
+        
+    except Exception as e:
+        print(f"Error during processing: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == '__main__':
