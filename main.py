@@ -1,6 +1,6 @@
 import argparse
 from enum import Enum
-from typing import Iterator, List
+from typing import Iterator, List, Tuple
 import json
 from datetime import datetime
 from collections import defaultdict
@@ -326,7 +326,7 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         yield annotated_frame
 
 
-def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_radar(source_video_path: str, device: str) -> Iterator[Tuple[np.ndarray, 'DataCollector']]:
     # Initialize data collector
     video_info = sv.VideoInfo.from_video_path(source_video_path)
     data_collector = DataCollector(fps=video_info.fps)
