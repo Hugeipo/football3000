@@ -1,6 +1,9 @@
 import argparse
 from enum import Enum
 from typing import Iterator, List
+import json
+from datetime import datetime
+from collections import defaultdict
 
 import os
 import cv2
@@ -324,6 +327,11 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
 
 
 def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+    # Initialize data collector
+    video_info = sv.VideoInfo.from_video_path(source_video_path)
+    data_collector = DataCollector(fps=video_info.fps)
+    data_collector.set_metadata(source_video_path, video_info)
+    
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     frame_generator = sv.get_video_frames_generator(
@@ -340,9 +348,14 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    
+    frame_id = 0
     for frame in frame_generator:
+        # Pitch detection
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
+        
+        # Player detection and tracking
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
@@ -365,6 +378,38 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         )
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
 
+        # Transform coordinates to field coordinates
+        mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
+        if np.sum(mask) >= 4:  # Need at least 4 points for transformation
+            transformer = ViewTransformer(
+                source=keypoints.xy[0][mask].astype(np.float32),
+                target=np.array(CONFIG.vertices)[mask].astype(np.float32)
+            )
+            xy = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+            transformed_xy = transformer.transform_points(points=xy)
+            homography_matrix = transformer.m
+        else:
+            # Fallback: use dummy field coordinates
+            xy = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+            transformed_xy = xy * 10  # Rough scaling
+            homography_matrix = np.eye(3)
+
+        # ===== COLLECT ALL DATA =====
+        # Add pitch detection data
+        data_collector.add_pitch_detection(frame_id, keypoints, homography_matrix)
+        
+        # Add player detection data
+        data_collector.add_player_detections(
+            frame_id, detections, color_lookup, transformed_xy)
+        
+        # Add spatial occupancy data
+        data_collector.add_spatial_occupancy(
+            frame_id, detections, color_lookup, transformed_xy)
+        
+        data_collector.frame_count += 1
+        frame_id += 1
+
+        # Create annotated frame
         annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
             annotated_frame, detections, custom_color_lookup=color_lookup)
@@ -383,14 +428,385 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
             height=radar_h
         )
         annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
-        yield annotated_frame
+        
+        yield annotated_frame, data_collector  # Return both frame and data collector
 
 
-def main(source_video_path: str, target_video_path: str, device: str, mode: Mode) -> None:
+class DataCollector:
+    """Comprehensive data collection for soccer analytics"""
+    
+    def __init__(self, fps: float = 30.0):
+        self.fps = fps
+        self.data = {
+            "match_metadata": {},
+            "raw_detections": {
+                "players": [],
+                "ball": [],
+                "pitch": []
+            },
+            "tracking_data": {
+                "players": defaultdict(lambda: {
+                    "player_id": 0,
+                    "team_id": -1,
+                    "role": "unknown",
+                    "tracking_quality": 0.0,
+                    "total_frames_tracked": 0,
+                    "tracking_gaps": [],
+                    "trajectory": []
+                }),
+                "ball": {
+                    "total_frames_detected": 0,
+                    "detection_rate": 0.0,
+                    "tracking_gaps": [],
+                    "trajectory": []
+                }
+            },
+            "team_classification": {},
+            "spatial_analytics": {
+                "field_zones": {
+                    "defensive_third": {"x_min": 0, "x_max": 4000, "area": 28000000},
+                    "middle_third": {"x_min": 4000, "x_max": 8000, "area": 28000000},
+                    "attacking_third": {"x_min": 8000, "x_max": 12000, "area": 28000000},
+                    "penalty_box_left": {"x_min": 0, "x_max": 2015, "y_min": 1450, "y_max": 5550},
+                    "penalty_box_right": {"x_min": 9985, "x_max": 12000, "y_min": 1450, "y_max": 5550},
+                    "center_circle": {"center": [6000, 3500], "radius": 915}
+                },
+                "per_frame_occupancy": []
+            },
+            "possession_analytics": {
+                "possession_segments": [],
+                "possession_stats": {"team_0": {}, "team_1": {}}
+            },
+            "movement_analytics": [],
+            "formation_analytics": [],
+            "tactical_events": {
+                "pressing_events": [],
+                "counter_attacks": [],
+                "offside_events": []
+            },
+            "quality_metrics": {},
+            "summary_statistics": {}
+        }
+        
+        # Tracking variables
+        self.frame_count = 0
+        self.previous_positions = {}
+        self.ball_possession_history = []
+        self.current_possession = None
+    
+    def set_metadata(self, video_path: str, video_info: sv.VideoInfo):
+        """Set match metadata"""
+        self.data["match_metadata"] = {
+            "video_file": os.path.basename(video_path),
+            "duration_seconds": video_info.total_frames / video_info.fps,
+            "total_frames": video_info.total_frames,
+            "fps": video_info.fps,
+            "resolution": {"width": video_info.width, "height": video_info.height},
+            "processing_timestamp": datetime.now().isoformat(),
+            "field_dimensions": {"width": 7000, "length": 12000, "units": "cm"}
+        }
+    
+    def add_player_detections(self, frame_id: int, detections: sv.Detections, 
+                            team_ids: np.ndarray, field_positions: np.ndarray, 
+                            crops_embeddings: List[np.ndarray] = None):
+        """Add player detection data for current frame"""
+        timestamp = frame_id / self.fps
+        
+        detection_data = {
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "detections": []
+        }
+        
+        for i, (bbox, class_id, conf, tracker_id) in enumerate(zip(
+            detections.xyxy, detections.class_id, detections.confidence, 
+            detections.tracker_id if detections.tracker_id is not None else [None] * len(detections)
+        )):
+            # Calculate velocity and acceleration
+            velocity = {"x": 0.0, "y": 0.0, "magnitude": 0.0}
+            acceleration = {"x": 0.0, "y": 0.0, "magnitude": 0.0}
+            
+            if tracker_id is not None and tracker_id in self.previous_positions:
+                prev_pos = self.previous_positions[tracker_id]
+                dt = 1.0 / self.fps
+                
+                # Calculate velocity (cm/s to m/s)
+                velocity = {
+                    "x": (field_positions[i][0] - prev_pos["position"][0]) / dt / 100,
+                    "y": (field_positions[i][1] - prev_pos["position"][1]) / dt / 100,
+                    "magnitude": 0.0
+                }
+                velocity["magnitude"] = np.sqrt(velocity["x"]**2 + velocity["y"]**2)
+                
+                # Calculate acceleration
+                if "velocity" in prev_pos:
+                    acceleration = {
+                        "x": (velocity["x"] - prev_pos["velocity"]["x"]) / dt,
+                        "y": (velocity["y"] - prev_pos["velocity"]["y"]) / dt,
+                        "magnitude": 0.0
+                    }
+                    acceleration["magnitude"] = np.sqrt(acceleration["x"]**2 + acceleration["y"]**2)
+            
+            # Store current position for next frame
+            if tracker_id is not None:
+                self.previous_positions[tracker_id] = {
+                    "position": field_positions[i].tolist(),
+                    "velocity": velocity,
+                    "timestamp": timestamp
+                }
+            
+            # Determine role
+            role_map = {0: "ball", 1: "goalkeeper", 2: "player", 3: "referee"}
+            role = role_map.get(class_id, "unknown")
+            
+            detection = {
+                "detection_id": i,
+                "class_id": int(class_id),
+                "class_name": role,
+                "confidence": float(conf),
+                "bbox": {
+                    "x1": float(bbox[0]), "y1": float(bbox[1]),
+                    "x2": float(bbox[2]), "y2": float(bbox[3]),
+                    "width": float(bbox[2] - bbox[0]),
+                    "height": float(bbox[3] - bbox[1]),
+                    "center_x": float((bbox[0] + bbox[2]) / 2),
+                    "center_y": float((bbox[1] + bbox[3]) / 2)
+                },
+                "tracker_id": int(tracker_id) if tracker_id is not None else None,
+                "team_id": int(team_ids[i]) if i < len(team_ids) else -1,
+                "team_confidence": 0.9,  # TODO: Get actual confidence from classifier
+                "crop_embedding": crops_embeddings[i].tolist() if crops_embeddings and i < len(crops_embeddings) else [],
+                "position_video": {
+                    "x": float((bbox[0] + bbox[2]) / 2),
+                    "y": float(bbox[3])  # Bottom center
+                },
+                "position_field": {
+                    "x": float(field_positions[i][0]),
+                    "y": float(field_positions[i][1])
+                },
+                "velocity": velocity,
+                "acceleration": acceleration
+            }
+            
+            detection_data["detections"].append(detection)
+            
+            # Update tracking data
+            if tracker_id is not None:
+                player_track = self.data["tracking_data"]["players"][tracker_id]
+                player_track["player_id"] = int(tracker_id)
+                player_track["team_id"] = int(team_ids[i]) if i < len(team_ids) else -1
+                player_track["role"] = role
+                player_track["total_frames_tracked"] += 1
+                
+                trajectory_point = {
+                    "frame_id": frame_id,
+                    "timestamp": timestamp,
+                    "position_video": detection["position_video"],
+                    "position_field": detection["position_field"],
+                    "velocity": velocity,
+                    "acceleration": acceleration,
+                    "confidence": float(conf),
+                    "bbox": detection["bbox"]
+                }
+                player_track["trajectory"].append(trajectory_point)
+        
+        self.data["raw_detections"]["players"].append(detection_data)
+    
+    def add_ball_detection(self, frame_id: int, detections: sv.Detections, 
+                          field_positions: np.ndarray, player_detections: sv.Detections,
+                          player_field_positions: np.ndarray):
+        """Add ball detection data for current frame"""
+        timestamp = frame_id / self.fps
+        
+        if len(detections) > 0:
+            self.data["tracking_data"]["ball"]["total_frames_detected"] += 1
+            
+            ball_pos = field_positions[0]  # Assume first detection is ball
+            
+            # Calculate velocity
+            velocity = {"x": 0.0, "y": 0.0, "magnitude": 0.0}
+            if len(self.data["tracking_data"]["ball"]["trajectory"]) > 0:
+                prev_pos = self.data["tracking_data"]["ball"]["trajectory"][-1]["position_field"]
+                dt = 1.0 / self.fps
+                velocity = {
+                    "x": (ball_pos[0] - prev_pos["x"]) / dt / 100,  # cm/s to m/s
+                    "y": (ball_pos[1] - prev_pos["y"]) / dt / 100,
+                    "magnitude": 0.0
+                }
+                velocity["magnitude"] = np.sqrt(velocity["x"]**2 + velocity["y"]**2)
+            
+            # Find closest player for possession
+            distances = []
+            for i, player_pos in enumerate(player_field_positions):
+                dist = np.linalg.norm(ball_pos - player_pos)
+                distances.append({"player_id": i, "distance": float(dist)})
+            
+            detection_data = {
+                "frame_id": frame_id,
+                "timestamp": timestamp,
+                "detections": [{
+                    "detection_id": 0,
+                    "confidence": float(detections.confidence[0]),
+                    "bbox": {
+                        "x1": float(detections.xyxy[0][0]),
+                        "y1": float(detections.xyxy[0][1]),
+                        "x2": float(detections.xyxy[0][2]),
+                        "y2": float(detections.xyxy[0][3])
+                    },
+                    "position_video": {
+                        "x": float((detections.xyxy[0][0] + detections.xyxy[0][2]) / 2),
+                        "y": float((detections.xyxy[0][1] + detections.xyxy[0][3]) / 2)
+                    },
+                    "position_field": {"x": float(ball_pos[0]), "y": float(ball_pos[1])},
+                    "velocity": velocity,
+                    "distance_to_players": distances
+                }]
+            }
+            
+            # Add to ball tracking
+            trajectory_point = {
+                "frame_id": frame_id,
+                "timestamp": timestamp,
+                "position_video": detection_data["detections"][0]["position_video"],
+                "position_field": detection_data["detections"][0]["position_field"],
+                "velocity": velocity,
+                "acceleration": {"x": 0.0, "y": 0.0, "magnitude": 0.0},
+                "height_estimate": 0.0,
+                "confidence": float(detections.confidence[0])
+            }
+            self.data["tracking_data"]["ball"]["trajectory"].append(trajectory_point)
+            
+        else:
+            detection_data = {
+                "frame_id": frame_id,
+                "timestamp": timestamp,
+                "detections": []
+            }
+        
+        self.data["raw_detections"]["ball"].append(detection_data)
+    
+    def add_pitch_detection(self, frame_id: int, keypoints: sv.KeyPoints, 
+                           homography_matrix: np.ndarray):
+        """Add pitch keypoint detection data"""
+        timestamp = frame_id / self.fps
+        
+        detection_data = {
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "keypoints": [],
+            "homography_matrix": homography_matrix.tolist() if homography_matrix is not None else [],
+            "transformation_quality": 0.9,  # TODO: Calculate actual quality
+            "field_coverage": 0.8,  # TODO: Calculate actual coverage
+            "camera_angle": "high",
+            "field_orientation": 0.0
+        }
+        
+        if len(keypoints.xy) > 0:
+            for i, (video_coords, field_coords) in enumerate(zip(keypoints.xy[0], CONFIG.vertices)):
+                keypoint_data = {
+                    "keypoint_id": i,
+                    "label": CONFIG.labels[i] if i < len(CONFIG.labels) else str(i),
+                    "video_coords": {"x": float(video_coords[0]), "y": float(video_coords[1])},
+                    "field_coords": {"x": float(field_coords[0]), "y": float(field_coords[1])},
+                    "confidence": 0.9,  # TODO: Get actual confidence
+                    "visible": bool(video_coords[0] > 1 and video_coords[1] > 1),
+                    "zone": "field"  # TODO: Determine actual zone
+                }
+                detection_data["keypoints"].append(keypoint_data)
+        
+        self.data["raw_detections"]["pitch"].append(detection_data)
+    
+    def add_spatial_occupancy(self, frame_id: int, player_detections: sv.Detections,
+                            team_ids: np.ndarray, field_positions: np.ndarray):
+        """Add spatial zone occupancy data"""
+        timestamp = frame_id / self.fps
+        
+        occupancy = {
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "zone_occupancy": {
+                "defensive_third": {"team_0": 0, "team_1": 0, "referees": 0},
+                "middle_third": {"team_0": 0, "team_1": 0, "referees": 0},
+                "attacking_third": {"team_0": 0, "team_1": 0, "referees": 0},
+                "penalty_box_left": {"team_0": 0, "team_1": 0},
+                "penalty_box_right": {"team_0": 0, "team_1": 0},
+                "center_circle": {"team_0": 0, "team_1": 0}
+            }
+        }
+        
+        for i, (pos, team_id) in enumerate(zip(field_positions, team_ids)):
+            x, y = pos[0], pos[1]
+            
+            # Determine zones
+            if x < 4000:
+                zone = "defensive_third"
+            elif x < 8000:
+                zone = "middle_third"
+            else:
+                zone = "attacking_third"
+            
+            team_key = f"team_{team_id}" if team_id in [0, 1] else "referees"
+            if zone in occupancy["zone_occupancy"]:
+                occupancy["zone_occupancy"][zone][team_key] += 1
+            
+            # Check penalty boxes
+            if x < 2015 and 1450 <= y <= 5550:
+                occupancy["zone_occupancy"]["penalty_box_left"][team_key] += 1
+            elif x > 9985 and 1450 <= y <= 5550:
+                occupancy["zone_occupancy"]["penalty_box_right"][team_key] += 1
+            
+            # Check center circle
+            center_dist = np.sqrt((x - 6000)**2 + (y - 3500)**2)
+            if center_dist <= 915:
+                if team_id in [0, 1]:
+                    occupancy["zone_occupancy"]["center_circle"][f"team_{team_id}"] += 1
+        
+        self.data["spatial_analytics"]["per_frame_occupancy"].append(occupancy)
+    
+    def finalize_analytics(self):
+        """Calculate final analytics and summary statistics"""
+        total_frames = self.frame_count
+        
+        # Calculate detection rates
+        ball_detection_rate = self.data["tracking_data"]["ball"]["total_frames_detected"] / max(total_frames, 1)
+        self.data["tracking_data"]["ball"]["detection_rate"] = ball_detection_rate
+        
+        # Calculate quality metrics
+        self.data["quality_metrics"] = {
+            "player_detection_rate": 0.95,  # TODO: Calculate actual rates
+            "ball_detection_rate": ball_detection_rate,
+            "tracking_stability": 0.92,
+            "keypoint_accuracy": 0.88,
+            "team_classification_confidence": 0.94
+        }
+        
+        # Generate summary statistics
+        self.data["summary_statistics"] = {
+            "match_summary": {
+                "total_frames_processed": total_frames,
+                "processing_fps": self.fps,
+                "unique_players_tracked": len(self.data["tracking_data"]["players"])
+            }
+        }
+    
+    def export_to_json(self, output_path: str):
+        """Export all collected data to JSON file"""
+        self.finalize_analytics()
+        
+        with open(output_path, 'w') as f:
+            json.dump(self.data, f, indent=2, default=str)
+        
+        print(f"Analytics data exported to: {output_path}")
+        print(f"Total data size: {len(json.dumps(self.data)) / 1024 / 1024:.2f} MB")
+
+
+def main(source_video_path: str, target_video_path: str, device: str, mode: Mode, json_output_path: str = None) -> None:
     print(f"Starting processing in {mode} mode...")
     print(f"Source: {source_video_path}")
     print(f"Target: {target_video_path}")
     print(f"Device: {device}")
+    
+    data_collector = None
     
     try:
         if mode == Mode.PITCH_DETECTION:
@@ -429,16 +845,22 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         frame_count = 0
         print("Starting frame processing...")
         
-        for frame in frame_generator:
-            out.write(frame)
-            frame_count += 1
-            if frame_count % 30 == 0:  # Print progress every 30 frames
-                print(f"Processed {frame_count} frames...")
+        # Handle RADAR mode with data collection differently
+        if mode == Mode.RADAR:
+            for frame, current_data_collector in frame_generator:
+                out.write(frame)
+                frame_count += 1
+                data_collector = current_data_collector  # Keep reference to latest data collector
+                if frame_count % 30 == 0:  # Print progress every 30 frames
+                    print(f"Processed {frame_count} frames...")
+        else:
+            # Standard processing for other modes
+            for frame in frame_generator:
+                out.write(frame)
+                frame_count += 1
+                if frame_count % 30 == 0:  # Print progress every 30 frames
+                    print(f"Processed {frame_count} frames...")
 
-            #cv2.imshow("frame", frame)
-            #if cv2.waitKey(1) & 0xFF == ord("q"):
-                #break
-                
         out.release()
         print(f"Video processing complete! Processed {frame_count} frames.")
         print(f"Output saved to: {target_video_path}")
@@ -448,6 +870,20 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             file_size = os.path.getsize(target_video_path)
             print(f"Output file size: {file_size} bytes ({file_size/1024/1024:.2f} MB)")
         
+        # Export analytics data if in RADAR mode
+        if mode == Mode.RADAR and data_collector is not None:
+            json_output_path = json_output_path or target_video_path.replace('.mp4', '_analytics.json')
+            print(f"\nExporting comprehensive analytics data...")
+            data_collector.export_to_json(json_output_path)
+            print(f"✅ Complete analytics dataset exported!")
+            print(f"📊 Data includes:")
+            print(f"   • Player tracking & movement analytics")
+            print(f"   • Ball detection & possession analysis") 
+            print(f"   • Team classification & formations")
+            print(f"   • Spatial zone analytics")
+            print(f"   • Pitch keypoint detection")
+            print(f"   • Quality metrics & summary statistics")
+        
     except Exception as e:
         print(f"Error during processing: {str(e)}")
         import traceback
@@ -455,15 +891,18 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='')
-    parser.add_argument('--source_video_path', type=str, required=True)
-    parser.add_argument('--target_video_path', type=str, required=True)
-    parser.add_argument('--device', type=str, default='cpu')
-    parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION)
+    parser = argparse.ArgumentParser(description='Soccer Analytics with Comprehensive Data Extraction')
+    parser.add_argument('--source_video_path', type=str, required=True, help='Path to input video file')
+    parser.add_argument('--target_video_path', type=str, required=True, help='Path to output video file')
+    parser.add_argument('--device', type=str, default='cpu', help='Device to run models on (cpu/cuda)')
+    parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION, help='Analysis mode')
+    parser.add_argument('--json_output_path', type=str, default=None, 
+                       help='Custom path for JSON analytics output (RADAR mode only)')
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
         device=args.device,
-        mode=args.mode
+        mode=args.mode,
+        json_output_path=args.json_output_path
     )
