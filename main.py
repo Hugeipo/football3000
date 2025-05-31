@@ -793,11 +793,22 @@ class DataCollector:
         """Export all collected data to JSON file"""
         self.finalize_analytics()
         
-        with open(output_path, 'w') as f:
-            json.dump(self.data, f, indent=2, default=str)
+        # Convert defaultdict to regular dict for JSON serialization
+        json_data = dict(self.data)
+        json_data["tracking_data"] = dict(json_data["tracking_data"])
+        json_data["tracking_data"]["players"] = dict(json_data["tracking_data"]["players"])
         
-        print(f"Analytics data exported to: {output_path}")
-        print(f"Total data size: {len(json.dumps(self.data)) / 1024 / 1024:.2f} MB")
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(json_data, f, indent=2, default=str)
+            
+            print(f"Analytics data exported to: {output_path}")
+            print(f"Total data size: {len(json.dumps(json_data)) / 1024 / 1024:.2f} MB")
+        except Exception as e:
+            print(f"ERROR: Failed to export JSON: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
 
 
 def main(source_video_path: str, target_video_path: str, device: str, mode: Mode, json_output_path: str = None) -> None:
@@ -871,9 +882,10 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             print(f"Output file size: {file_size} bytes ({file_size/1024/1024:.2f} MB)")
         
         # Export analytics data if in RADAR mode
+        print(f"Checking JSON export: mode={mode}, data_collector={'not None' if data_collector is not None else 'None'}")
         if mode == Mode.RADAR and data_collector is not None:
             json_output_path = json_output_path or target_video_path.replace('.mp4', '_analytics.json')
-            print(f"\nExporting comprehensive analytics data...")
+            print(f"\nExporting comprehensive analytics data to: {json_output_path}")
             data_collector.export_to_json(json_output_path)
             print(f"✅ Complete analytics dataset exported!")
             print(f"📊 Data includes:")
@@ -883,6 +895,10 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             print(f"   • Spatial zone analytics")
             print(f"   • Pitch keypoint detection")
             print(f"   • Quality metrics & summary statistics")
+        elif mode == Mode.RADAR:
+            print(f"WARNING: RADAR mode but data_collector is None!")
+        else:
+            print(f"Not in RADAR mode, skipping JSON export.")
         
     except Exception as e:
         print(f"Error during processing: {str(e)}")
