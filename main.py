@@ -252,14 +252,13 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
         result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
         return sv.Detections.from_ultralytics(result)
 
-    slicer = sv.InferenceSlicer(
+    ball_slicer = sv.InferenceSlicer(
         callback=callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
     )
 
     for frame in frame_generator:
-        detections = slicer(frame).with_nms(threshold=0.1)
+        detections = ball_slicer(frame).with_nms(threshold=0.1)
         detections = ball_tracker.update(detections)
         annotated_frame = frame.copy()
         annotated_frame = ball_annotator.annotate(annotated_frame, detections)
@@ -376,7 +375,6 @@ def run_radar(source_video_path: str, device: str) -> Iterator[Tuple[np.ndarray,
 
     ball_slicer = sv.InferenceSlicer(
         callback=ball_callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
     )
     
@@ -616,29 +614,38 @@ class DataCollector:
             velocity = {"x": 0.0, "y": 0.0, "magnitude": 0.0}
             acceleration = {"x": 0.0, "y": 0.0, "magnitude": 0.0}
             
-            if tracker_id is not None and int(tracker_id) in self.previous_positions:
-                prev_pos = self.previous_positions[int(tracker_id)]
-                dt = 1.0 / self.fps
+            # Bounds check for field_positions
+            if i >= len(field_positions):
+                # Fallback to video coordinates if field transformation failed
+                field_x = float((bbox[0] + bbox[2]) / 2)
+                field_y = float(bbox[3])
+            else:
+                field_x = float(field_positions[i][0])
+                field_y = float(field_positions[i][1])
                 
-                # Calculate velocity (cm/s to m/s)
-                velocity = {
-                    "x": (field_positions[i][0] - prev_pos["position"][0]) / dt / 100,
-                    "y": (field_positions[i][1] - prev_pos["position"][1]) / dt / 100,
-                    "magnitude": 0.0
-                }
-                velocity["magnitude"] = np.sqrt(velocity["x"]**2 + velocity["y"]**2)
-                
-                # Calculate acceleration
-                if "velocity" in prev_pos:
-                    acceleration = {
-                        "x": (velocity["x"] - prev_pos["velocity"]["x"]) / dt,
-                        "y": (velocity["y"] - prev_pos["velocity"]["y"]) / dt,
+                if tracker_id is not None and int(tracker_id) in self.previous_positions:
+                    prev_pos = self.previous_positions[int(tracker_id)]
+                    dt = 1.0 / self.fps
+                    
+                    # Calculate velocity (cm/s to m/s)
+                    velocity = {
+                        "x": (field_positions[i][0] - prev_pos["position"][0]) / dt / 100,
+                        "y": (field_positions[i][1] - prev_pos["position"][1]) / dt / 100,
                         "magnitude": 0.0
                     }
-                    acceleration["magnitude"] = np.sqrt(acceleration["x"]**2 + acceleration["y"]**2)
+                    velocity["magnitude"] = np.sqrt(velocity["x"]**2 + velocity["y"]**2)
+                    
+                    # Calculate acceleration
+                    if "velocity" in prev_pos:
+                        acceleration = {
+                            "x": (velocity["x"] - prev_pos["velocity"]["x"]) / dt,
+                            "y": (velocity["y"] - prev_pos["velocity"]["y"]) / dt,
+                            "magnitude": 0.0
+                        }
+                        acceleration["magnitude"] = np.sqrt(acceleration["x"]**2 + acceleration["y"]**2)
             
             # Store current position for next frame
-            if tracker_id is not None:
+            if tracker_id is not None and i < len(field_positions):
                 self.previous_positions[int(tracker_id)] = {
                     "position": field_positions[i].tolist(),
                     "velocity": velocity,
@@ -671,8 +678,8 @@ class DataCollector:
                     "y": float(bbox[3])  # Bottom center
                 },
                 "position_field": {
-                    "x": float(field_positions[i][0]),
-                    "y": float(field_positions[i][1])
+                    "x": field_x,
+                    "y": field_y
                 },
                 "velocity": velocity,
                 "acceleration": acceleration
