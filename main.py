@@ -445,15 +445,7 @@ class DataCollector:
                 "pitch": []
             },
             "tracking_data": {
-                "players": defaultdict(lambda: {
-                    "player_id": 0,
-                    "team_id": -1,
-                    "role": "unknown",
-                    "tracking_quality": 0.0,
-                    "total_frames_tracked": 0,
-                    "tracking_gaps": [],
-                    "trajectory": []
-                }),
+                "players": {},
                 "ball": {
                     "total_frames_detected": 0,
                     "detection_rate": 0.0,
@@ -592,6 +584,18 @@ class DataCollector:
             
             # Update tracking data
             if tracker_id is not None:
+                # Create player entry if it doesn't exist (since we removed defaultdict)
+                if tracker_id not in self.data["tracking_data"]["players"]:
+                    self.data["tracking_data"]["players"][tracker_id] = {
+                        "player_id": int(tracker_id),
+                        "team_id": -1,
+                        "role": "unknown",
+                        "tracking_quality": 0.0,
+                        "total_frames_tracked": 0,
+                        "tracking_gaps": [],
+                        "trajectory": []
+                    }
+                
                 player_track = self.data["tracking_data"]["players"][tracker_id]
                 player_track["player_id"] = int(tracker_id)
                 player_track["team_id"] = int(team_ids[i]) if i < len(team_ids) else -1
@@ -793,17 +797,12 @@ class DataCollector:
         """Export all collected data to JSON file"""
         self.finalize_analytics()
         
-        # Convert defaultdict to regular dict for JSON serialization
-        json_data = dict(self.data)
-        json_data["tracking_data"] = dict(json_data["tracking_data"])
-        json_data["tracking_data"]["players"] = dict(json_data["tracking_data"]["players"])
-        
         try:
             with open(output_path, 'w') as f:
-                json.dump(json_data, f, indent=2, default=str)
+                json.dump(self.data, f, indent=2, default=str)
             
             print(f"Analytics data exported to: {output_path}")
-            print(f"Total data size: {len(json.dumps(json_data)) / 1024 / 1024:.2f} MB")
+            print(f"Total data size: {len(json.dumps(self.data)) / 1024 / 1024:.2f} MB")
         except Exception as e:
             print(f"ERROR: Failed to export JSON: {str(e)}")
             import traceback
@@ -812,10 +811,18 @@ class DataCollector:
 
 
 def main(source_video_path: str, target_video_path: str, device: str, mode: Mode, json_output_path: str = None) -> None:
+    print("🏈 FOOTBALL3000 - Soccer Analytics with Comprehensive Data Extraction")
+    print("✅ JSON EXPORT SUPPORTED - Fixed defaultdict serialization bug")
+    print("📊 RADAR mode exports complete analytics to JSON file")
+    print("=" * 60)
     print(f"Starting processing in {mode} mode...")
     print(f"Source: {source_video_path}")
     print(f"Target: {target_video_path}")
     print(f"Device: {device}")
+    if mode == Mode.RADAR:
+        json_path = json_output_path or target_video_path.replace('.mp4', '_analytics.json')
+        print(f"📄 JSON Output: {json_path}")
+    print("=" * 60)
     
     data_collector = None
     
