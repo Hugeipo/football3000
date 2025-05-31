@@ -73,6 +73,30 @@ ELLIPSE_LABEL_ANNOTATOR = sv.LabelAnnotator(
 )
 
 
+def convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to Python native types for JSON serialization.
+    This handles both values and dictionary keys.
+    """
+    if isinstance(obj, dict):
+        # Convert both keys and values
+        return {convert_numpy_types(k): convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy_types(item) for item in obj)
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
+
+
 class Mode(Enum):
     """
     Enum class representing different modes of operation for Soccer AI video analysis.
@@ -518,8 +542,8 @@ class DataCollector:
             velocity = {"x": 0.0, "y": 0.0, "magnitude": 0.0}
             acceleration = {"x": 0.0, "y": 0.0, "magnitude": 0.0}
             
-            if tracker_id is not None and tracker_id in self.previous_positions:
-                prev_pos = self.previous_positions[tracker_id]
+            if tracker_id is not None and int(tracker_id) in self.previous_positions:
+                prev_pos = self.previous_positions[int(tracker_id)]
                 dt = 1.0 / self.fps
                 
                 # Calculate velocity (cm/s to m/s)
@@ -541,7 +565,7 @@ class DataCollector:
             
             # Store current position for next frame
             if tracker_id is not None:
-                self.previous_positions[tracker_id] = {
+                self.previous_positions[int(tracker_id)] = {
                     "position": field_positions[i].tolist(),
                     "velocity": velocity,
                     "timestamp": timestamp
@@ -584,9 +608,10 @@ class DataCollector:
             
             # Update tracking data
             if tracker_id is not None:
+                tracker_id_int = int(tracker_id)
                 # Create player entry if it doesn't exist (since we removed defaultdict)
-                if tracker_id not in self.data["tracking_data"]["players"]:
-                    self.data["tracking_data"]["players"][tracker_id] = {
+                if tracker_id_int not in self.data["tracking_data"]["players"]:
+                    self.data["tracking_data"]["players"][tracker_id_int] = {
                         "player_id": int(tracker_id),
                         "team_id": -1,
                         "role": "unknown",
@@ -596,7 +621,7 @@ class DataCollector:
                         "trajectory": []
                     }
                 
-                player_track = self.data["tracking_data"]["players"][tracker_id]
+                player_track = self.data["tracking_data"]["players"][tracker_id_int]
                 player_track["player_id"] = int(tracker_id)
                 player_track["team_id"] = int(team_ids[i]) if i < len(team_ids) else -1
                 player_track["role"] = role
@@ -798,11 +823,14 @@ class DataCollector:
         self.finalize_analytics()
         
         try:
+            # Convert numpy types to Python native types before serialization
+            serializable_data = convert_numpy_types(self.data)
+            
             with open(output_path, 'w') as f:
-                json.dump(self.data, f, indent=2, default=str)
+                json.dump(serializable_data, f, indent=2)
             
             print(f"Analytics data exported to: {output_path}")
-            print(f"Total data size: {len(json.dumps(self.data)) / 1024 / 1024:.2f} MB")
+            print(f"Total data size: {len(json.dumps(serializable_data)) / 1024 / 1024:.2f} MB")
         except Exception as e:
             print(f"ERROR: Failed to export JSON: {str(e)}")
             import traceback
